@@ -47,7 +47,35 @@ cd habitica-mcp-server
 npm install
 ```
 
-3. **Set API credentials** (see next section)
+3. **Set API credentials and security configuration**
+
+Create a `.env` file (copy from `.env.example`):
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your credentials:
+```env
+# Habitica API credentials (required)
+HABITICA_USER_ID=your_habitica_user_id_here
+HABITICA_API_TOKEN=your_habitica_api_token_here
+
+# Security configuration (highly recommended)
+MCP_API_KEY=your_secret_api_key_here
+ALLOWED_IPS=127.0.0.1,::1
+RATE_LIMIT_MAX=100
+REQUIRE_AUTHENTICATION=true
+```
+
+**🔒 Security Note**: To protect your Habitica account, it's **strongly recommended** to set:
+- `MCP_API_KEY`: Requires clients to provide this key in `X-MCP-API-Key` header
+- `ALLOWED_IPS`: Comma-separated list of allowed IP addresses (supports CIDR)
+- `RATE_LIMIT_MAX`: Maximum requests per hour per IP
+- `REQUIRE_AUTHENTICATION`: Whether to enforce authentication on all endpoints
+
+**Getting your Habitica credentials**:
+1. Go to [Habitica Settings > API](https://habitica.com/user/settings/api)
+2. Copy your User ID and API Token
 
 4. **Start the server**
 ```bash
