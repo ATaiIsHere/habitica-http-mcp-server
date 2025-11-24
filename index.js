@@ -1372,7 +1372,7 @@ async function runServer() {
   });
   
   // 啟動 HTTP 服務器
-  webApp.listen(port, process.env.HOST || 'localhost', () => {
+  webApp.listen(port, process.env.HOST || '0.0.0.0', () => {
     console.error(`🏰 Habitica MCP HTTP 服務器已啟動`);
     console.error(`📚 文檔界面: http://localhost:${port}`);
     console.error(`🔧 MCP 端點: http://localhost:${port}/mcp`);
