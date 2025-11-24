@@ -16,9 +16,7 @@ import { setLanguage, t } from './i18n.js';
 // Habitica API 基础配置
 const HABITICA_API_BASE = 'https://habitica.com/api/v3';
 
-// 驗證相關環境變數
-const HABITICA_USER_ID = process.env.HABITICA_USER_ID;
-const HABITICA_API_TOKEN = process.env.HABITICA_API_TOKEN;
+// 驗證相關環境變數（僅用於 MCP 服務器安全設置）
 const MCP_API_KEY = process.env.MCP_API_KEY; // MCP 服務器的 API 密鑰
 const ALLOWED_IPS = process.env.ALLOWED_IPS ? process.env.ALLOWED_IPS.split(',').map(ip => ip.trim()) : []; // IP 白名單
 const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX) || 100; // 每小時的請求数量限制
@@ -27,20 +25,25 @@ const REQUIRE_AUTHENTICATION = process.env.REQUIRE_AUTHENTICATION !== 'false'; /
 // Detect language (default EN)
 setLanguage(process.env.MCP_LANG || process.env.LANG || 'en');
 
-if (!HABITICA_USER_ID || !HABITICA_API_TOKEN) {
-  console.error(t('Error: Please set HABITICA_USER_ID and HABITICA_API_TOKEN environment variables', '错误: 请设置 HABITICA_USER_ID 和 HABITICA_API_TOKEN 环境变量'));
-  process.exit(1);
+// 創建 Habitica API 客戶端（支持多用戶）
+function createHabiticaClient(userId, apiToken) {
+  if (!userId || !apiToken) {
+    throw new McpError(
+      ErrorCode.InvalidRequest,
+      t('Missing Habitica credentials. Please provide X-Habitica-User and X-Habitica-Token headers.', 
+        '缺少 Habitica 憑證。請提供 X-Habitica-User 和 X-Habitica-Token 請求頭。')
+    );
+  }
+  
+  return axios.create({
+    baseURL: HABITICA_API_BASE,
+    headers: {
+      'x-api-user': userId,
+      'x-api-key': apiToken,
+      'Content-Type': 'application/json',
+    },
+  });
 }
-
-// 创建 Habitica API 客户端
-const habiticaClient = axios.create({
-  baseURL: HABITICA_API_BASE,
-  headers: {
-    'x-api-user': HABITICA_USER_ID,
-    'x-api-key': HABITICA_API_TOKEN,
-    'Content-Type': 'application/json',
-  },
-});
 
 // 速率限制儲存（簡單內存實現）
 const rateLimitStore = new Map();
@@ -111,6 +114,8 @@ function createAuthMiddleware() {
                      req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown';
     const userAgent = req.headers['user-agent'];
     const apiKey = req.headers['x-mcp-api-key'] || req.query.apiKey;
+    const habiticaUser = req.headers['x-habitica-user'];
+    const habiticaToken = req.headers['x-habitica-token'];
     const endpoint = req.path;
     
     // 記錄請求
@@ -151,6 +156,23 @@ function createAuthMiddleware() {
       });
     }
     
+    // 檢查 Habitica 憑證（除了文檔和健康檢查端點）
+    if (endpoint !== '/' && endpoint !== '/health' && endpoint !== '/tools') {
+      if (!habiticaUser || !habiticaToken) {
+        return res.status(401).json({
+          error: '未授權',
+          message: '缺少 Habitica 憑證。請在請求標頭中提供 X-Habitica-User 和 X-Habitica-Token。',
+          hint: '從 https://habitica.com/user/settings/api 獲取您的憑證'
+        });
+      }
+    }
+    
+    // 將憑證附加到請求對象
+    req.habiticaCredentials = {
+      userId: habiticaUser,
+      apiToken: habiticaToken
+    };
+    
     // 設置速率限制標頭
     res.set({
       'X-RateLimit-Limit': RATE_LIMIT_MAX,
@@ -172,86 +194,89 @@ const mcpServer = new McpServer({
 const server = mcpServer.server;
 
 // 工具處理函數的統一入口
-async function handleToolCall(name, args) {
+async function handleToolCall(name, args, credentials) {
+  // 創建專屬於此用戶的 Habitica 客戶端
+  const habiticaClient = createHabiticaClient(credentials?.userId, credentials?.apiToken);
+  
   try {
     switch (name) {
       case 'get_user_profile':
-        return await getUserProfile();
+        return await getUserProfile(habiticaClient);
       
       case 'get_tasks':
-        return await getTasks(args.type);
+        return await getTasks(habiticaClient, args.type);
       
       case 'create_task':
-        return await createTask(args);
+        return await createTask(habiticaClient, args);
       
       case 'score_task':
-        return await scoreTask(args.taskId, args.direction);
+        return await scoreTask(habiticaClient, args.taskId, args.direction);
       
       case 'update_task':
-        return await updateTask(args.taskId, args);
+        return await updateTask(habiticaClient, args.taskId, args);
       
       case 'delete_task':
-        return await deleteTask(args.taskId);
+        return await deleteTask(habiticaClient, args.taskId);
       
       case 'get_stats':
-        return await getStats();
+        return await getStats(habiticaClient);
       
       case 'buy_reward':
-        return await buyReward(args.key);
+        return await buyReward(habiticaClient, args.key);
       
       case 'get_inventory':
-        return await getInventory();
+        return await getInventory(habiticaClient);
       
       case 'cast_spell':
-        return await castSpell(args.spellId, args.targetId);
+        return await castSpell(habiticaClient, args.spellId, args.targetId);
       
       case 'get_tags':
-        return await getTags();
+        return await getTags(habiticaClient);
       
       case 'create_tag':
-        return await createTag(args.name);
+        return await createTag(habiticaClient, args.name);
       
       case 'get_pets':
-        return await getPets();
+        return await getPets(habiticaClient);
       
       case 'feed_pet':
-        return await feedPet(args.pet, args.food);
+        return await feedPet(habiticaClient, args.pet, args.food);
       
       case 'hatch_pet':
-        return await hatchPet(args.egg, args.hatchingPotion);
+        return await hatchPet(habiticaClient, args.egg, args.hatchingPotion);
       
       case 'get_mounts':
-        return await getMounts();
+        return await getMounts(habiticaClient);
       
       case 'equip_item':
-        return await equipItem(args.type, args.key);
+        return await equipItem(habiticaClient, args.type, args.key);
       
       case 'get_notifications':
-        return await getNotifications();
+        return await getNotifications(habiticaClient);
       
       case 'read_notification':
-        return await readNotification(args.notificationId);
+        return await readNotification(habiticaClient, args.notificationId);
       
       case 'get_shop':
-        return await getShop(args.shopType);
+        return await getShop(habiticaClient, args.shopType);
       
       case 'buy_item':
-        return await buyItem(args.itemKey, args.quantity);
+        return await buyItem(habiticaClient, args.itemKey, args.quantity);
       
       case 'get_task_checklist':
-        return await getTaskChecklist(args.taskId);
+        return await getTaskChecklist(habiticaClient, args.taskId);
       
       case 'add_checklist_item':
-        return await addChecklistItem(args.taskId, args.text);
+        return await addChecklistItem(habiticaClient, args.taskId, args.text);
       
       case 'update_checklist_item':
-        return await updateChecklistItem(args.taskId, args.itemId, args);
+        return await updateChecklistItem(habiticaClient, args.taskId, args.itemId, args);
       
       case 'delete_checklist_item':
-        return await deleteChecklistItem(args.taskId, args.itemId);
+        return await deleteChecklistItem(habiticaClient, args.taskId, args.itemId);
       
       case 'score_checklist_item':
-        return await scoreChecklistItem(args.taskId, args.itemId);
+        return await scoreChecklistItem(habiticaClient, args.taskId, args.itemId);
       
       default:
         throw new McpError(ErrorCode.MethodNotFound, `未知工具: ${name}`);
@@ -698,14 +723,16 @@ tools.forEach(tool => {
   mcpServer.registerTool(tool.name, {
     description: tool.description,
     inputSchema: tool.inputSchema
-  }, async (args) => {
+  }, async (args, extra) => {
+    // 從 MCP 請求上下文中獲取憑證
+    const credentials = extra?.meta?.habiticaCredentials;
     // 使用工具名稱調用相應的處理函數
-    return await handleToolCall(tool.name, args);
+    return await handleToolCall(tool.name, args, credentials);
   });
 });
 
 // 工具实现函数
-async function getUserProfile() {
+async function getUserProfile(habiticaClient) {
   const response = await habiticaClient.get('/user');
   const user = response.data.data;
   
@@ -719,7 +746,7 @@ async function getUserProfile() {
   };
 }
 
-async function getTasks(type) {
+async function getTasks(habiticaClient, type) {
   const endpoint = type ? `/tasks/user?type=${type}` : '/tasks/user';
   const response = await habiticaClient.get(endpoint);
   
@@ -733,7 +760,7 @@ async function getTasks(type) {
   };
 }
 
-async function createTask(taskData) {
+async function createTask(habiticaClient, taskData) {
   const response = await habiticaClient.post('/tasks/user', taskData);
   const task = response.data.data;
   
@@ -747,7 +774,7 @@ async function createTask(taskData) {
   };
 }
 
-async function scoreTask(taskId, direction = 'up') {
+async function scoreTask(habiticaClient, taskId, direction = 'up') {
   const response = await habiticaClient.post(`/tasks/${taskId}/score/${direction}`);
   const result = response.data.data;
   
@@ -766,7 +793,7 @@ async function scoreTask(taskId, direction = 'up') {
   };
 }
 
-async function updateTask(taskId, updates) {
+async function updateTask(habiticaClient, taskId, updates) {
   const response = await habiticaClient.put(`/tasks/${taskId}`, updates);
   const task = response.data.data;
   
@@ -780,7 +807,7 @@ async function updateTask(taskId, updates) {
   };
 }
 
-async function deleteTask(taskId) {
+async function deleteTask(habiticaClient, taskId) {
   await habiticaClient.delete(`/tasks/${taskId}`);
   
   return {
@@ -793,7 +820,7 @@ async function deleteTask(taskId) {
   };
 }
 
-async function getStats() {
+async function getStats(habiticaClient) {
   const response = await habiticaClient.get('/user');
   
   return {
@@ -806,7 +833,7 @@ async function getStats() {
   };
 }
 
-async function buyReward(key) {
+async function buyReward(habiticaClient, key) {
   const response = await habiticaClient.post(`/user/buy/${key}`);
   const result = response.data.data;
   
@@ -820,7 +847,7 @@ async function buyReward(key) {
   };
 }
 
-async function getInventory() {
+async function getInventory(habiticaClient) {
   const response = await habiticaClient.get('/user');
   
   return {
@@ -833,7 +860,7 @@ async function getInventory() {
   };
 }
 
-async function castSpell(spellId, targetId) {
+async function castSpell(habiticaClient, spellId, targetId) {
   const endpoint = targetId ? `/user/class/cast/${spellId}?targetId=${targetId}` : `/user/class/cast/${spellId}`;
   const response = await habiticaClient.post(endpoint);
   
@@ -847,7 +874,7 @@ async function castSpell(spellId, targetId) {
   };
 }
 
-async function getTags() {
+async function getTags(habiticaClient) {
   const response = await habiticaClient.get('/tags');
   
   return {
@@ -860,7 +887,7 @@ async function getTags() {
   };
 }
 
-async function createTag(name) {
+async function createTag(habiticaClient, name) {
   const response = await habiticaClient.post('/tags', { name });
   const tag = response.data.data;
   
@@ -874,7 +901,7 @@ async function createTag(name) {
   };
 }
 
-async function getPets() {
+async function getPets(habiticaClient) {
   const response = await habiticaClient.get('/user');
   
   return {
@@ -887,7 +914,7 @@ async function getPets() {
   };
 }
 
-async function feedPet(pet, food) {
+async function feedPet(habiticaClient, pet, food) {
   const response = await habiticaClient.post(`/user/feed/${pet}/${food}`);
   const result = response.data.data;
   
@@ -906,7 +933,7 @@ async function feedPet(pet, food) {
   };
 }
 
-async function hatchPet(egg, hatchingPotion) {
+async function hatchPet(habiticaClient, egg, hatchingPotion) {
   const response = await habiticaClient.post(`/user/hatch/${egg}/${hatchingPotion}`);
   const result = response.data.data;
   
@@ -920,7 +947,7 @@ async function hatchPet(egg, hatchingPotion) {
   };
 }
 
-async function getMounts() {
+async function getMounts(habiticaClient) {
   const response = await habiticaClient.get('/user');
   
   return {
@@ -933,7 +960,7 @@ async function getMounts() {
   };
 }
 
-async function equipItem(type, key) {
+async function equipItem(habiticaClient, type, key) {
   const response = await habiticaClient.post(`/user/equip/${type}/${key}`);
   
   return {
@@ -946,7 +973,7 @@ async function equipItem(type, key) {
   };
 }
 
-async function getNotifications() {
+async function getNotifications(habiticaClient) {
   const response = await habiticaClient.get('/notifications');
   
   return {
@@ -959,7 +986,7 @@ async function getNotifications() {
   };
 }
 
-async function readNotification(notificationId) {
+async function readNotification(habiticaClient, notificationId) {
   await habiticaClient.post(`/notifications/${notificationId}/read`);
   
   return {
@@ -972,7 +999,7 @@ async function readNotification(notificationId) {
   };
 }
 
-async function getShop(shopType = 'market') {
+async function getShop(habiticaClient, shopType = 'market') {
   const response = await habiticaClient.get(`/shops/${shopType}`);
   
   return {
@@ -985,7 +1012,7 @@ async function getShop(shopType = 'market') {
   };
 }
 
-async function buyItem(itemKey, quantity = 1) {
+async function buyItem(habiticaClient, itemKey, quantity = 1) {
   const response = await habiticaClient.post(`/user/buy/${itemKey}`, { quantity });
   const result = response.data.data;
   
@@ -999,7 +1026,7 @@ async function buyItem(itemKey, quantity = 1) {
   };
 }
 
-async function getTaskChecklist(taskId) {
+async function getTaskChecklist(habiticaClient, taskId) {
   const response = await habiticaClient.get(`/tasks/${taskId}`);
   const task = response.data.data;
   const checklist = task.checklist || [];
@@ -1020,7 +1047,7 @@ async function getTaskChecklist(taskId) {
   };
 }
 
-async function addChecklistItem(taskId, text) {
+async function addChecklistItem(habiticaClient, taskId, text) {
   const response = await habiticaClient.post(`/tasks/${taskId}/checklist`, { text });
   const item = response.data.data;
   
@@ -1034,7 +1061,7 @@ async function addChecklistItem(taskId, text) {
   };
 }
 
-async function updateChecklistItem(taskId, itemId, updates) {
+async function updateChecklistItem(habiticaClient, taskId, itemId, updates) {
   const response = await habiticaClient.put(`/tasks/${taskId}/checklist/${itemId}`, updates);
   const item = response.data.data;
   
@@ -1048,7 +1075,7 @@ async function updateChecklistItem(taskId, itemId, updates) {
   };
 }
 
-async function deleteChecklistItem(taskId, itemId) {
+async function deleteChecklistItem(habiticaClient, taskId, itemId) {
   await habiticaClient.delete(`/tasks/${taskId}/checklist/${itemId}`);
   
   return {
@@ -1061,7 +1088,7 @@ async function deleteChecklistItem(taskId, itemId) {
   };
 }
 
-async function scoreChecklistItem(taskId, itemId) {
+async function scoreChecklistItem(habiticaClient, taskId, itemId) {
   const response = await habiticaClient.post(`/tasks/${taskId}/checklist/${itemId}/score`);
   const item = response.data.data;
   
